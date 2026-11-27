@@ -1,0 +1,152 @@
+# Builds SNES, the Xbox (UWP) app made from Snes9x, and publishes the install files.
+#
+# Every push to the main branch replaces the release named in RELEASE_TAG, so the files are always at the same
+# links (no zip):
+#   releases/download/<tag>/SNES.msix   the app
+#   releases/download/<tag>/Microsoft.VCLibs.x64.14.00.appx   its dependency (add it next to the app)
+#   releases/download/<tag>/SNES.cer    the test certificate (for installing on a Windows PC)
+name: SNES (Xbox)
+
+on:
+  push:
+    branches: ['xbox/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snes-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDL3_UWP_REPO: https://github.com/SternXD/SDL3-uwp.git
+  SDL3_UWP_COMMIT: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
+  RELEASE_TAG: latest
+
+jobs:
+  build:
+    name: Build SNES (x64)
+    runs-on: windows-2025
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pick Visual Studio
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          & $vswhere -products * -format text -property displayName
+          cmake --version
+          $has2026 = [bool](& $vswhere -products * -version '[18.0,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          $cmake2026 = [bool]((cmake --help) -match 'Visual Studio 18 2026')
+          $generator = if ($has2026 -and $cmake2026) { 'Visual Studio 18 2026' } else { 'Visual Studio 17 2022' }
+          Write-Host "Generator: $generator"
+          "generator=$generator" >> $env:GITHUB_OUTPUT
+
+      - name: Compute version
+        id: version
+        shell: pwsh
+        run: |
+          $cmake = Get-Content Xbox/CMakeLists.txt -Raw
+          if ($cmake -notmatch 'project\(SNESXbox VERSION (\d+)\.(\d+)\.(\d+)') { throw 'Could not read the version' }
+          $version = "$($Matches[1]).$($Matches[2]).$($Matches[3]).$env:GITHUB_RUN_NUMBER"
+          Write-Host "Package version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Cache SDL3-uwp
+        uses: actions/cache@v4
+        with:
+          path: out/uwp-deps
+          key: sdl3-uwp-${{ env.SDL3_UWP_COMMIT }}-${{ steps.vs.outputs.generator }}
+
+      - name: Build SDL3-uwp
+        shell: pwsh
+        run: |
+          if (Test-Path out/uwp-deps/bin/SDL3.dll) { Write-Host 'SDL3-uwp restored from cache'; exit 0 }
+          git init out/SDL3-uwp
+          git -C out/SDL3-uwp remote add origin $env:SDL3_UWP_REPO
+          git -C out/SDL3-uwp fetch --depth 1 origin $env:SDL3_UWP_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download SDL3-uwp' }
+          git -C out/SDL3-uwp checkout FETCH_HEAD
+          cmake -S out/SDL3-uwp -B out/SDL3-build -G "${{ steps.vs.outputs.generator }}" -A x64 `
+            "-DCMAKE_SYSTEM_NAME=WindowsStore" "-DCMAKE_SYSTEM_VERSION=10.0" "-DCMAKE_INSTALL_PREFIX=$PWD/out/uwp-deps" `
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'SDL3-uwp configure failed' }
+          cmake --build out/SDL3-build --config Release --target install -- /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw 'SDL3-uwp build failed' }
+
+      - name: Configure SNES
+        shell: pwsh
+        run: |
+          cmake -S Xbox -B out/xbox -G "${{ steps.vs.outputs.generator }}" -A x64 `
+            "-DCMAKE_SYSTEM_NAME=WindowsStore" "-DCMAKE_SYSTEM_VERSION=10.0" "-DCMAKE_PREFIX_PATH=$PWD/out/uwp-deps" `
+            "-DAPP_PACKAGE_VERSION=${{ steps.version.outputs.version }}"
+          if ($LASTEXITCODE -ne 0) { throw 'Configure failed' }
+
+      - name: Build SNES
+        shell: pwsh
+        run: |
+          cmake --build out/xbox --config Release --target SNES -- /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+      - name: Collect install files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $msix = Get-ChildItem out/xbox -Recurse -Filter *.msix | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (!$msix) { throw 'No .msix was made' }
+          Copy-Item $msix.FullName dist/SNES.msix
+          $vclibs = Get-ChildItem $msix.Directory.FullName -Recurse -Filter 'Microsoft.VCLibs.x64.14.00.appx' | Select-Object -First 1
+          if (!$vclibs) {
+            $vclibs = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs" -Recurse -Filter 'Microsoft.VCLibs.x64.14.00.appx' |
+              Where-Object { $_.FullName -match 'Retail' } | Select-Object -First 1
+          }
+          if ($vclibs) { Copy-Item $vclibs.FullName dist/ } else { Write-Warning 'Microsoft.VCLibs .appx not found' }
+          $cer = Get-ChildItem $msix.Directory.FullName -Filter *.cer | Select-Object -First 1
+          if ($cer) { Copy-Item $cer.FullName dist/SNES.cer }
+          Get-ChildItem dist
+
+      - name: Upload crash lookup map
+        uses: actions/upload-artifact@v4
+        with:
+          name: snes-${{ steps.version.outputs.version }}-map
+          path: out/xbox/SNES.map
+          if-no-files-found: warn
+
+      - name: Upload install files
+        uses: actions/upload-artifact@v4
+        with:
+          name: snes-${{ steps.version.outputs.version }}
+          path: dist/*
+          compression-level: 0
+
+  latest:
+    name: Publish latest build
+    if: github.ref == 'refs/heads/xbox/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download install files
+        uses: actions/download-artifact@v4
+        with:
+          name: snes-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Replace the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          ls -la dist
+          notes="SNES for Xbox, version $VERSION. Made from Snes9x (https://github.com/snes9xgit/snes9x), non-commercial license, source in this repository.
+          On the Xbox Device Portal, add SNES.msix, and add the Microsoft.VCLibs .appx file as its dependency.
+          Games are found in ES-DE\\ROMs\\snes on your drive, or a SNES\\Games folder."
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "SNES (latest build $VERSION)" --notes "$notes"
